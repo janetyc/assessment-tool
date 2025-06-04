@@ -897,8 +897,11 @@ def display_reference_with_style(ref, validation_result, style_info, ref_type="s
                 with cols[1]:
                     if components['source']:
                         st.markdown(f"**Source:** {components['source']}")
+                if components['volume']:
                     if components['volume']:
                         st.markdown(f"**Volume:** {components['volume']}")
+                    if components['issue']:
+                        st.markdown(f"**Issue:** {components['issue']}")
                     if components['pages']:
                         st.markdown(f"**Pages:** {components['pages']}")
     
@@ -1009,7 +1012,9 @@ with col2:
                     
                     references_report += "## Detailed Reference Analysis\n\n"
                     for i, ref in enumerate(references, 1):
+                        # Get style and validation info
                         style_info = detect_citation_style(ref)
+                        style = style_info[0]  # Extract style name from tuple
                         validation_result = validate_reference(ref)
                         
                         references_report += f"### Reference {i}\n"
@@ -1045,7 +1050,7 @@ with col2:
                     'MLA': 'Lastname, Firstname. "Article Title in Title Case." *Journal Name*, vol. 10, no. 2, 2023, pp. 123-145.',
                     'Chicago': 'Lastname, Firstname. "Article Title in Title Case." *Journal Name* 10, no. 2 (2023): 123-145. https://doi.org/10.1234/example.',
                     'IEEE': '[1] F. M. Lastname and F. M. Lastname, "Article title in title case," *Journal Name*, vol. 10, no. 2, pp. 123-145, 2023.',
-                    'ACM': '[1] Patricia S. Abril and Robert Plant. 2007. The patent holder\'s dilemma: Buy, sell, or troll? Commun. ACM 50, 1 (Jan. 2007), 36-44. https://doi.org/10.1145/1188913.1188915'
+                    'ACM': 'Lastname, F. and Lastname, F. 2023. Article title in sentence case. *Journal Name* 10, 2 (2023), 123-145. DOI:https://doi.org/10.1234/example'
                 }
                 
                 for style, example in style_examples.items():
