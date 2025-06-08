@@ -153,58 +153,251 @@ def check_rate_limit(domain):
 
 def split_body_and_references(text):
     """
-    Split the extracted PDF text into body_text and references_text.
-    Only when a page's first line begins with a reference header
-    (e.g. "References"), remove that header and collect the rest of that page
-    as the references section, stopping at the next page break.
+    Enhanced function to split the extracted PDF text into body_text and references_text.
+    Handles various scenarios:
+    - Reference headers with page numbers: "Page 15 References"
+    - Section numbers: "7. References" or "Section 7 References"
+    - Headers anywhere in line: "15 REFERENCES AND BIBLIOGRAPHY"
+    - References without explicit headers (detected by reference patterns)
+    - Multiple possible reference section locations
     """
+    # Handle None or empty text
+    if text is None:
+        return "", ""
+    
     ref_headers = [
         "references", "bibliography", "works cited", "literature cited", 
-        "cited works", "sources"
+        "cited works", "sources", "reference list", "citations"
     ]
     
     lines = text.split('\n')
     page_delim_pattern = re.compile(r'^--- Page \d+ ---$', re.IGNORECASE)
     
-    for i, line in enumerate(lines):
-        if i > 0 and page_delim_pattern.match(lines[i - 1].strip()):
-            first_line = line.strip()
-            lower = first_line.lower()
-            
-            for header in ref_headers:
-                if header in lower:
-                    remainder = first_line[len(header):].lstrip()
-                    
-                    next_page_idx = None
-                    for j in range(i + 1, len(lines)):
-                        if page_delim_pattern.match(lines[j].strip()):
-                            next_page_idx = j
-                            break
-                    
-                    if next_page_idx is not None:
-                        if remainder:
-                            refs_lines = [remainder] + lines[i+1:next_page_idx]
-                        else:
-                            refs_lines = lines[i+1:next_page_idx]
-                        references_text = '\n'.join(refs_lines)
-                        
-                        body_before = lines[:i]
-                        body_after = lines[next_page_idx:]
-                        body_text = '\n'.join(body_before + body_after)
-                    else:
-                        if remainder:
-                            refs_lines = [remainder] + lines[i+1:]
-                        else:
-                            refs_lines = lines[i+1:]
-                        references_text = '\n'.join(refs_lines)
-                        body_text = '\n'.join(lines[:i])
-                    
-                    return body_text, references_text
+    def contains_reference_header(line_text):
+        """Check if line contains a reference header, handling various prefixes."""
+        line_lower = line_text.lower().strip()
+        
+        # First, check if line starts with a reference header pattern
+        # We'll be more lenient with length if it starts with a clear header
+        header_at_start = False
+        
+        # Quick check for headers at start of line
+        for header in ref_headers:
+            if line_lower.startswith(header) or re.match(rf'^\d+\s*{header}', line_lower) or re.match(rf'^page\s*\d*\s*{header}', line_lower):
+                header_at_start = True
+                break
+        
+        # If header is NOT at start and line is too long, skip (likely body text)
+        if not header_at_start and len(line_lower) > 100:
+            return False
+        
+        # Skip if line contains common sentence indicators (unless header is clearly at start)
+        sentence_indicators = ['the ', 'this ', 'these ', 'those ', 'for ', 'see ', 'in ', 'of ', 'to ', 'with ', 'from ', 'and ', 'or ', 'but ', 'however ', 'therefore ', 'according ', 'based on']
+        if not header_at_start and any(indicator in line_lower for indicator in sentence_indicators):
+            return False
+        
+        # Patterns to match reference headers with various prefixes (more restrictive)
+        patterns = [
+            # Direct header match (start of line or after number/section)
+            rf'^({"|".join(ref_headers)})(?:\s|$)',
+            # With page numbers: "Page 15 References"
+            rf'^page\s+\d+\s+({"|".join(ref_headers)})(?:\s|$)',
+            # With section numbers: "7. References" or "Section 7 References"  
+            rf'^(?:section\s+)?\d+\.?\s+({"|".join(ref_headers)})(?:\s|$)',
+            # Roman numerals: "VII. References"
+            rf'^(?:section\s+)?[ivxlcdm]+\.?\s+({"|".join(ref_headers)})(?:\s|$)',
+            # Appendix: "Appendix A: References"
+            rf'^appendix\s+[a-z]\.?\s*:?\s*({"|".join(ref_headers)})(?:\s|$)',
+            # Just numbers before: "15 REFERENCES" (but only if short line)
+            rf'^\d+\s+({"|".join(ref_headers)})(?:\s|$)',
+            # Concatenated formats: "19REFERENCES", "15BIBLIOGRAPHY" (numbers directly attached)
+            rf'^\d+({"|".join(ref_headers)})(?:\s|$)',
+            # Concatenated with page: "PageREFERENCES", "Page15REFERENCES"
+            rf'^page\d*({"|".join(ref_headers)})(?:\s|$)',
+            # Centered or standalone headers (short lines with only the header word)
+            rf'^({"|".join(ref_headers)})(?:\s+(?:and\s+)?(?:bibliography|citations|list|sources))?$',
+            # Combined headers like "References and Bibliography"
+            rf'^({"|".join(ref_headers)})\s+and\s+({"|".join(ref_headers)})$'
+        ]
+        
+        for pattern in patterns:
+            if re.search(pattern, line_lower):
+                return True
+        return False
     
+    def extract_content_after_header(line_text, header_found):
+        """Extract any content that comes after the reference header in the same line."""
+        line_lower = line_text.lower()
+        
+        # Find where the header ends and extract remainder
+        for header in ref_headers:
+            if header in line_lower:
+                header_pos = line_lower.find(header)
+                header_end = header_pos + len(header)
+                remainder = line_text[header_end:].strip()
+                
+                # Remove common separators
+                remainder = re.sub(r'^[\s\-.:]+', '', remainder)
+                return remainder
+        return ""
+    
+    def looks_like_references_section(lines_sample):
+        """Check if a section looks like references based on content patterns."""
+        if not lines_sample:
+            return False
+            
+        # Join sample lines to analyze
+        sample_text = '\n'.join(lines_sample[:10])  # Check first 10 lines
+        
+        # Count reference-like patterns
+        ref_patterns = [
+            r'^\s*\[\d+\]',  # [1] format
+            r'^\s*\d+\.',    # 1. format  
+            r'^\s*\d+\s+[A-Z]', # Plain number format
+            r'[A-Z][a-z]+,\s+[A-Z]\..*?\(\d{4}\)', # Author, A. (year)
+            r'et\s+al\.',    # et al.
+            r'doi:|DOI:',    # DOI references
+            r'https?://',    # URLs
+            r'\(\d{4}\)',    # Years in parentheses
+            r'vol\.\s*\d+|volume\s+\d+', # Volume numbers
+            r'pp?\.\s*\d+',  # Page numbers
+        ]
+        
+        pattern_count = 0
+        for pattern in ref_patterns:
+            matches = re.findall(pattern, sample_text, re.MULTILINE | re.IGNORECASE)
+            pattern_count += len(matches)
+        
+        # If we find multiple reference indicators, likely a references section
+        return pattern_count >= 3
+    
+
+    # First pass: Look for explicit reference headers
+    for i, line in enumerate(lines):
+        line_stripped = line.strip()
+        
+        # Check if this line contains a reference header
+        if contains_reference_header(line_stripped):
+            # Check if this header appears after a page delimiter (common case)
+            is_after_page_break = (i > 0 and page_delim_pattern.match(lines[i - 1].strip()))
+            
+            # Extract any content after the header
+            remainder = extract_content_after_header(line_stripped, True)
+            
+            # Find the end of this section (next page or end of document)
+            next_page_idx = None
+            for j in range(i + 1, len(lines)):
+                if page_delim_pattern.match(lines[j].strip()):
+                    next_page_idx = j
+                    break
+            
+            # Collect references content, handling blank lines after headers
+            if next_page_idx is not None:
+                # Include content from the same line as header if present
+                refs_lines = []
+                if remainder:
+                    refs_lines.append(remainder)
+                
+                # Add content after header, but clean up empty lines
+                content_lines = lines[i+1:next_page_idx]
+                # Keep all lines but clean up leading/trailing empty lines
+                while content_lines and not content_lines[0].strip():
+                    content_lines.pop(0)  # Remove leading empty lines
+                while content_lines and not content_lines[-1].strip():
+                    content_lines.pop()   # Remove trailing empty lines
+                    
+                refs_lines.extend(content_lines)
+                references_text = '\n'.join(refs_lines)
+                
+                # Remove this section from body (include page marker if header is after page break)
+                if is_after_page_break:
+                    body_before = lines[:i-1]  # Exclude page marker and header
+                else:
+                    body_before = lines[:i]  # Just exclude header
+                body_after = lines[next_page_idx:]
+                body_text = '\n'.join(body_before + body_after)
+            else:
+                # References go to end of document
+                refs_lines = []
+                if remainder:
+                    refs_lines.append(remainder)
+                
+                # Add content after header, but clean up empty lines
+                content_lines = lines[i+1:]
+                while content_lines and not content_lines[0].strip():
+                    content_lines.pop(0)  # Remove leading empty lines
+                while content_lines and not content_lines[-1].strip():
+                    content_lines.pop()   # Remove trailing empty lines
+                    
+                refs_lines.extend(content_lines)
+                references_text = '\n'.join(refs_lines)
+                
+                # Remove this section from body (include page marker if header is after page break)
+                if is_after_page_break:
+                    body_text = '\n'.join(lines[:i-1])  # Exclude page marker and header
+                else:
+                    body_text = '\n'.join(lines[:i])  # Just exclude header
+            
+            return body_text, references_text
+    
+    # Second pass: Look for reference sections without explicit headers
+    # Check each page for reference-like content
+    page_starts = []
+    for i, line in enumerate(lines):
+        if page_delim_pattern.match(line.strip()):
+            page_starts.append(i)
+    
+    # Check pages starting from the end (references usually at end)
+    for page_start in reversed(page_starts[-3:]):  # Check last 3 pages
+        # Find next page boundary
+        next_page_start = None
+        for next_start in page_starts:
+            if next_start > page_start:
+                next_page_start = next_start
+                break
+        
+        if next_page_start:
+            page_lines = lines[page_start+1:next_page_start]
+        else:
+            page_lines = lines[page_start+1:]
+        
+        # Skip very short pages
+        if len(page_lines) < 5:
+            continue
+            
+        # Check if this page looks like references
+        if looks_like_references_section(page_lines):
+            references_text = '\n'.join(page_lines)
+            
+            # Remove this page from body
+            body_before = lines[:page_start]
+            if next_page_start:
+                body_after = lines[next_page_start:]
+                body_text = '\n'.join(body_before + body_after)
+            else:
+                body_text = '\n'.join(body_before)
+            
+            return body_text, references_text
+    
+    # Third pass: Look for reference patterns in the last portion of the document
+    # Sometimes references appear without clear page boundaries
+    if len(lines) > 50:  # Only for reasonably long documents
+        last_quarter = lines[-len(lines)//4:]  # Last 25% of document
+        
+        if looks_like_references_section(last_quarter):
+            split_point = len(lines) - len(last_quarter)
+            body_text = '\n'.join(lines[:split_point])
+            references_text = '\n'.join(last_quarter)
+            return body_text, references_text
+    
+    # If no references section found, return original text
     return text, ""
 
 def extract_in_text_citations(body_text):
     """Extract in-text citations from the body text."""
+    if body_text is None:
+        body_text = ""
+    
     numbered = re.findall(r'\[(\d+)\]', body_text)
     author_year = re.findall(r'\(([A-Z][A-Za-z]+, \d{4}(; [A-Z][A-Za-z]+, \d{4})*)\)', body_text)
     return {
@@ -214,6 +407,9 @@ def extract_in_text_citations(body_text):
 
 def extract_in_text_citation_sentences(body_text):
     """Extract sentences containing in-text citations."""
+    if body_text is None:
+        body_text = ""
+    
     sentence_pattern = re.compile(r'(?<=[.!?])\s+')
     sentences = sentence_pattern.split(body_text)
     
@@ -233,27 +429,185 @@ def extract_in_text_citation_sentences(body_text):
     return citation_sentences
 
 def extract_references_multiline(text):
-    """Extract references from multiline text."""
+    """
+    Extract references from multiline text with support for multiple formats:
+    - [1] Format: [1] Author, A. (2023). Title...
+    - 1. Format: 1. Author, A. (2023). Title...
+    - Plain number: 1 Author, A. (2023). Title...
+    - Author format: Author, A. et al. (2023). Title...
+    - Author year: Authorname et al. (2023)
+    """
+    if text is None:
+        return []
+    
     lines = text.split('\n')
     references = []
     current_ref = []
 
-    ref_start_pattern = re.compile(r'^\s*(\[\d+\]|\d+\.)')
+    # Enhanced patterns for different reference formats
+    ref_start_patterns = [
+        # [1] format - bracketed numbers
+        re.compile(r'^\s*\[\d+\]'),
+        # 1. format - numbered with period
+        re.compile(r'^\s*\d+\.'),
+        # Plain number format - just number followed by space and capital letter
+        re.compile(r'^\s*\d+\s+[A-Z]'),
+        # Author format - starts with author name (Last, First or Last, F.)
+        re.compile(r'^\s*[A-Z][a-z]+,\s+[A-Z]\.?\s*(?:[A-Z]\.?\s*)?(?:,?\s*(?:and|&)\s+[A-Z][a-z]+,\s+[A-Z]\.?\s*(?:[A-Z]\.?\s*)?)*(?:,?\s*et\s+al\.)?'),
+        # Author et al. format - starts with author followed by et al.
+        re.compile(r'^\s*[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\s+et\s+al\.'),
+        # Simple author year format
+        re.compile(r'^\s*[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s+\(\d{4}\)')
+    ]
 
+    def is_reference_start(line_text):
+        """Check if line starts a new reference using any of the patterns."""
+        line_text = line_text.strip()
+        if not line_text:
+            return False
+        
+        for pattern in ref_start_patterns:
+            if pattern.match(line_text):
+                return True
+        return False
+
+    def is_continuation_line(line_text):
+        """Check if line is a continuation of a reference."""
+        line_text = line_text.strip()
+        if not line_text:
+            return False
+        
+        # Common indicators of continuation lines
+        continuation_indicators = [
+            # Starts with lowercase (likely continuation)
+            re.compile(r'^\s*[a-z]'),
+            # Starts with common journal/publisher words
+            re.compile(r'^\s*(?:In|Proceedings|Journal|IEEE|ACM|Springer|Elsevier)', re.IGNORECASE),
+            # Starts with volume/page info
+            re.compile(r'^\s*(?:vol\.|volume|pp?\.|pages?|doi:|https?://)', re.IGNORECASE),
+            # Starts with punctuation (comma, period)
+            re.compile(r'^\s*[,.]'),
+            # URL or DOI on separate line
+            re.compile(r'^\s*(?:https?://|doi:|www\.)', re.IGNORECASE),
+            # Continuation of title or publisher info (common patterns)
+            re.compile(r'^\s*(?:regelzaken|nederland|Annaouderenzorg)', re.IGNORECASE)
+        ]
+        
+        for pattern in continuation_indicators:
+            if pattern.match(line_text):
+                return True
+        return False
+    
+    def looks_like_new_reference(line_text, previous_line=None):
+        """Enhanced logic to determine if a line starts a new reference."""
+        line_text = line_text.strip()
+        if not line_text:
+            return False
+            
+        # If it matches standard patterns, it's definitely a new reference
+        if is_reference_start(line_text):
+            return True
+            
+        # Additional heuristics for author-style references
+        # Check if line starts with author name pattern (e.g., "Alzheimer Nederland.")
+        author_patterns = [
+            # Organization or author name followed by period and year
+            re.compile(r'^[A-Z][a-zA-Z\s]+\.?\s*\([12]\d{3}', re.IGNORECASE),
+            # Organization name followed by colon (like "Alzheimer Nederland:")
+            re.compile(r'^[A-Z][a-zA-Z\s]+:\s*', re.IGNORECASE),
+            # Simple organization or author name at start
+            re.compile(r'^[A-Z][a-zA-Z\s]{10,}\.?\s*\(', re.IGNORECASE)
+        ]
+        
+        for pattern in author_patterns:
+            if pattern.match(line_text):
+                return True
+        
+        # If previous line ended with URL or period and this starts with capital, likely new ref
+        if previous_line and (previous_line.strip().endswith('/') or previous_line.strip().endswith('.')):
+            if line_text[0].isupper() and len(line_text) > 10:
+                return True
+                
+        return False
+
+    previous_line = None
     for line in lines:
-        if ref_start_pattern.match(line.strip()):
+        line_stripped = line.strip()
+        
+        # Skip empty lines but track them for reference separation
+        if not line_stripped:
+            # Empty line might separate references, save current if exists
             if current_ref:
                 references.append(' '.join(current_ref).strip())
                 current_ref = []
-            current_ref.append(line.strip())
-        else:
+            previous_line = line
+            continue
+            
+        # Check if this line starts a new reference
+        if looks_like_new_reference(line_stripped, previous_line) or is_reference_start(line_stripped):
+            # Save previous reference if exists
             if current_ref:
-                current_ref.append(line.strip())
+                references.append(' '.join(current_ref).strip())
+                current_ref = []
+            current_ref.append(line_stripped)
+        elif current_ref and (is_continuation_line(line_stripped) or 
+                             # If we're already in a reference and line doesn't clearly start a new one
+                             not looks_like_new_reference(line_stripped, previous_line)):
+            current_ref.append(line_stripped)
+        else:
+            # Line might start a new reference or be standalone
+            if current_ref:
+                references.append(' '.join(current_ref).strip())
+                current_ref = []
+            current_ref.append(line_stripped)
+        
+        previous_line = line
     
+    # Add final reference if exists
     if current_ref:
         references.append(' '.join(current_ref).strip())
 
-    return references
+    # Filter out very short references and common non-reference patterns
+    filtered_references = []
+    for ref in references:
+        ref_lower = ref.lower().strip()
+        
+        # Skip common non-reference patterns
+        skip_patterns = [
+            'no references available',
+            'no citations found',
+            'references not available',
+            'none available',
+            'not applicable',
+            'n/a',
+            'tbd',
+            'to be determined',
+            'coming soon',
+            'under construction'
+        ]
+        
+        # Check if this is a non-reference pattern
+        is_non_reference = any(pattern in ref_lower for pattern in skip_patterns)
+        
+        # Only include references with reasonable length, content, and not matching skip patterns
+        if not is_non_reference and len(ref) > 20 and (' ' in ref or ',' in ref):
+            # Additional check: must contain some reference-like indicators
+            ref_indicators = [
+                r'\d{4}',  # Year
+                r'[A-Z][a-z]+,',  # Author pattern
+                r'\..*\.',  # Multiple periods (title/journal pattern)
+                r'http',  # URL
+                r'doi',  # DOI
+                r'vol\.?|volume',  # Volume
+                r'pp?\.?',  # Pages
+                r'journal|proceedings|conference',  # Publication types
+            ]
+            
+            has_indicator = any(re.search(pattern, ref, re.IGNORECASE) for pattern in ref_indicators)
+            if has_indicator:
+                filtered_references.append(ref)
+    
+    return filtered_references
 
 # ============================================================================
 # CITATION STYLE ANALYSIS FUNCTIONS
@@ -711,6 +1065,37 @@ def create_citation_report(references, style_counts):
     return report
 
 # ============================================================================
+# INTERACTIVE RE-ANALYSIS FUNCTIONS
+# ============================================================================
+
+def perform_reanalysis(modified_content):
+    """Perform re-analysis on modified content."""
+    # Handle None or empty content
+    if modified_content is None:
+        modified_content = ""
+    
+    # Split body and references
+    body_text, references_text = split_body_and_references(modified_content)
+    references = extract_references_multiline(references_text)
+    in_text_citations = extract_in_text_citations(body_text)
+    citation_sentences = extract_in_text_citation_sentences(body_text)
+    
+    # Style analysis
+    style_counts = defaultdict(int)
+    for ref in references:
+        style_info = detect_citation_style(ref)
+        style_counts[style_info[0]] += 1
+    
+    return {
+        'body_text': body_text,
+        'references_text': references_text,
+        'references': references,
+        'in_text_citations': in_text_citations,
+        'citation_sentences': citation_sentences,
+        'style_counts': style_counts
+    }
+
+# ============================================================================
 # MAIN APPLICATION
 # ============================================================================
 
@@ -760,6 +1145,8 @@ def main():
         - Detect and validate references with citation style analysis
         - Check if citations follow academic formats (APA, MLA, Chicago, IEEE, ACM)
         - Analyze in-text citations and reference consistency
+        
+        **🆕 Interactive Feature:** After extraction, you can edit the content and click **"Re-analyze Citations"** to handle custom reference formats or fix extraction issues.
     """)
 
     # Create layout
@@ -772,6 +1159,12 @@ def main():
     with col2:
         if uploaded_file is not None:
             try:
+                # Reset session state when a new file is uploaded
+                if 'uploaded_file_name' not in st.session_state or st.session_state.uploaded_file_name != uploaded_file.name:
+                    st.session_state.uploaded_file_name = uploaded_file.name
+                    st.session_state.current_content = None
+                    st.session_state.analysis_results = None
+                
                 pdf_reader = PyPDF2.PdfReader(uploaded_file)
                 
                 text_content = ""
@@ -785,33 +1178,150 @@ def main():
                 # Create tabs
                 tab1, tab2, tab3, tab4 = st.tabs(["📝 Content", "🔎 In-Text Citations", "📚 References", "📊 Citation Analysis"])
                 
-                # Split body and references
-                body_text, references_text = split_body_and_references(text_content)
-                references = extract_references_multiline(references_text)
-                in_text_citations = extract_in_text_citations(body_text)
+                # Initialize session state for content and analysis results
+                if 'current_content' not in st.session_state or st.session_state.current_content is None:
+                    st.session_state.current_content = text_content
+                if 'analysis_results' not in st.session_state:
+                    st.session_state.analysis_results = None
+                
+                # Ensure current_content is not None before analysis
+                if st.session_state.current_content is None:
+                    st.session_state.current_content = text_content
+                
+                # Perform initial analysis or use cached results
+                if st.session_state.analysis_results is None:
+                    try:
+                        st.session_state.analysis_results = perform_reanalysis(st.session_state.current_content)
+                    except Exception as e:
+                        st.error(f"Error during initial analysis: {str(e)}")
+                        # Create empty results as fallback
+                        st.session_state.analysis_results = {
+                            'body_text': st.session_state.current_content or "",
+                            'references_text': "",
+                            'references': [],
+                            'in_text_citations': {'numbered': [], 'author_year': []},
+                            'citation_sentences': [],
+                            'style_counts': defaultdict(int)
+                        }
                 
                 with tab1:
                     st.subheader("Extracted Content")
-                    st.text_area("PDF Content", text_content, height=400)
                     
-                    if text_content:
+                    # Instructions for interactive feature
+                    with st.expander("💡 How to use Interactive Re-analysis"):
+                        st.markdown("""
+                        **Step 1:** Review the extracted content below
+                        
+                        **Step 2:** Edit the content if needed:
+                        - Fix OCR errors or formatting issues
+                        - Manually separate references section if not detected
+                        - Add missing reference headers (e.g., "References", "Bibliography")
+                        - Fix malformed reference entries
+                        
+                        **Step 3:** Click **"Re-analyze Citations"** to update all analysis tabs
+                        
+                        **Common fixes:**
+                        - Add `--- Page X ---` markers to separate sections
+                        - Add `References` header before reference list
+                        - Fix concatenated headers like `19REFERENCES` → `19 REFERENCES`
+                        - Separate merged references into individual lines
+                        """)
+                    
+                    # Editable text area for content modification
+                    content_value = st.session_state.current_content if st.session_state.current_content is not None else ""
+                    
+                    # Use a dynamic key to force refresh when needed
+                    if 'text_area_key' not in st.session_state:
+                        st.session_state.text_area_key = 0
+                    
+                    modified_content = st.text_area(
+                        "PDF Content (You can edit this content and re-analyze)",
+                        value=content_value,
+                        height=400,
+                        key=f"content_editor_{st.session_state.text_area_key}",
+                        help="Edit the extracted content to fix issues, then click 'Re-analyze Citations'"
+                    )
+                    
+                    # Debug info
+                    if modified_content != content_value:
+                        st.info(f"🔄 Content changed! Modified length: {len(modified_content)}, Original length: {len(content_value)}")
+                        st.info("Click 'Re-analyze Citations' to update the analysis.")
+                    
+                    # Additional debug information
+                    st.caption(f"🔍 Debug: Text area content length: {len(modified_content)} | Session content length: {len(st.session_state.current_content) if st.session_state.current_content else 0}")
+                    
+                    # Re-analyze button
+                    col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 2])
+                    
+                    with col_btn1:
+                        if st.button("🔄 Re-analyze Citations", type="primary"):
+                            # Always use the current content from the text area, not session state comparison
+                            st.session_state.current_content = modified_content
+                            try:
+                                with st.spinner("Re-analyzing citations..."):
+                                    new_results = perform_reanalysis(modified_content)
+                                    st.session_state.analysis_results = new_results
+                                
+                                st.success("✅ Re-analysis completed!")
+                                st.info(f"Found {len(new_results['references'])} references, {len(new_results['citation_sentences'])} citation sentences")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error during re-analysis: {str(e)}")
+                    
+                    with col_btn2:
+                        if st.button("↩️ Reset to Original"):
+                            st.session_state.current_content = text_content
+                            st.session_state.text_area_key += 1  # Force text area refresh
+                            try:
+                                st.session_state.analysis_results = perform_reanalysis(text_content)
+                                st.success("✅ Reset to original content!")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error during reset: {str(e)}")
+                    
+                    with col_btn3:
+                        if st.button("🔄 Force Refresh"):
+                            st.session_state.text_area_key += 1  # Force text area refresh
+                            st.success("✅ Text area refreshed!")
+                            st.rerun()
+                    
+                    # Download button and statistics
+                    if st.session_state.current_content:
                         st.download_button(
-                            label="Download Extracted Text",
-                            data=text_content,
+                            label="Download Current Text",
+                            data=st.session_state.current_content,
                             file_name=f"{Path(uploaded_file.name).stem}_extracted.txt",
                             mime="text/plain"
                         )
+                        
+                        # Show statistics
+                        original_length = len(text_content) if text_content else 0
+                        current_content = st.session_state.current_content or ""
+                        current_length = len(current_content)
+                        length_diff = current_length - original_length
+                        
                         st.info(f"""
-                            📊 **File Statistics**
+                            📊 **Content Statistics**
                             - File name: {uploaded_file.name}
                             - Number of pages: {len(pdf_reader.pages)}
-                            - Extracted text length: {len(text_content)} characters
+                            - Original text length: {original_length:,} characters
+                            - Current text length: {current_length:,} characters
+                            - Difference: {length_diff:+,} characters
                         """)
+                
+                # Get current analysis results
+                results = st.session_state.analysis_results
                 
                 with tab2:
                     st.subheader("In-Text Citations (with Sentences)")
-                    citation_sentences = extract_in_text_citation_sentences(body_text)
+                    citation_sentences = results['citation_sentences']
+                    
+                    # Debug info
+                    current_content_length = len(st.session_state.current_content) if st.session_state.current_content else 0
+                    st.caption(f"🔍 Debug: Content length: {current_content_length} chars | Analysis timestamp: {id(results)}")
+                    
                     if citation_sentences:
+                        st.info(f"Found {len(citation_sentences)} sentences with citations")
                         for item in citation_sentences:
                             st.markdown(f"**Citations:** {', '.join(item['citations'])}")
                             st.write(item["sentence"])
@@ -821,9 +1331,21 @@ def main():
                 
                 with tab3:
                     st.subheader("References Section")
-                    st.write(references_text)
-                    st.write("--------------------------------")
-
+                    references_text = results['references_text']
+                    references = results['references']
+                    
+                    # Enhanced debug info
+                    current_content_length = len(st.session_state.current_content) if st.session_state.current_content else 0
+                    st.caption(f"🔍 Debug: Content length: {current_content_length} chars | References text: {len(references_text)} chars | Found {len(references)} references | Analysis ID: {id(results)} | Text area key: {st.session_state.get('text_area_key', 'N/A')}")
+                    
+                    # Show first 200 chars of current content for verification
+                    if st.session_state.current_content:
+                        st.caption(f"📄 Current content preview: {repr(st.session_state.current_content[:200])}...")
+                    
+                    with st.expander("🔍 Raw References Text"):
+                        st.text(references_text)
+                    
+                    st.write("**Extracted References:**")
                     if references:
                         st.write(f"Found {len(references)} references:")
                         for i, ref in enumerate(references, 1):
@@ -833,12 +1355,13 @@ def main():
                 
                 with tab4:
                     st.subheader("Citation Analysis")
+                    references = results['references']
+                    style_counts = results['style_counts']
+                    
                     if references:
-                        style_counts = defaultdict(int)
                         for i, ref in enumerate(references, 1):
                             st.markdown(f"### Reference {i}")
                             style_info = detect_citation_style(ref)
-                            style_counts[style_info[0]] += 1
                             validation_result = validate_reference(ref)
                             display_reference_with_style(ref, validation_result, style_info)
                             st.markdown("---")
