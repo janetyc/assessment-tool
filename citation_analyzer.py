@@ -954,19 +954,57 @@ def validate_reference(ref):
     results = {
         'valid': False,
         'doi_found': False,
+        'doi_valid': False,
         'url_found': False,
+        'url_valid': False,
         'scholar_search': None,
         'message': '',
         'rate_limited': False,
-        'acm_url': False
+        'acm_url': False,
+        'doi_text': '',
+        'url_text': ''
     }
+    
+    # Extract DOI from reference and validate it
+    doi_match = re.search(r'(?:doi:?\s*|https?://doi\.org/)(10\.\d{4,}/[^\s,]+)', ref, re.IGNORECASE)
+    if doi_match:
+        doi = doi_match.group(1)
+        results['doi_found'] = True
+        results['doi_text'] = doi
+        
+        # Check rate limit for DOI validation
+        if check_rate_limit('doi.org'):
+            try:
+                results['doi_valid'] = validate_doi(doi)
+                if results['doi_valid']:
+                    results['valid'] = True
+                    results['message'] = f"✅ DOI validated successfully: {doi}"
+                else:
+                    results['message'] = f"❌ DOI does not resolve: {doi}"
+            except Exception as e:
+                results['message'] = f"⚠️ Error validating DOI {doi}: {str(e)}"
+        else:
+            results['rate_limited'] = True
+            results['message'] = f"⏳ Rate limited - cannot validate DOI: {doi}"
+    
+    # Extract URL from reference (excluding DOI URLs)
+    url_match = re.search(r'https?://(?!doi\.org)[^\s<>"\']+', ref)
+    if url_match:
+        url = url_match.group(0)
+        results['url_found'] = True
+        results['url_text'] = clean_url(url)
+        
+        # For now, we don't validate general URLs due to rate limiting concerns
+        # But we mark that a URL was found
+        results['message'] += f" | 🔗 URL found: {results['url_text']}" if results['message'] else f"🔗 URL found: {results['url_text']}"
     
     # Create Google Scholar search URL for manual verification
     search_query = urllib.parse.quote(ref[:200])
     results['scholar_search'] = f"https://scholar.google.com/scholar?q={search_query}"
     
-    if not results['valid']:
-        results['message'] = f"ℹ️ Reference needs manual verification: {ref}"
+    # If no DOI or URL validation occurred, provide default message
+    if not results['doi_found'] and not results['url_found']:
+        results['message'] = f"ℹ️ No DOI or URL found for validation"
     
     return results
 
@@ -997,6 +1035,35 @@ def display_reference_with_style(ref, validation_result, style_info, ref_type="s
     st.markdown(f"**Reference:** {ref}")
     st.markdown(format_style_confidence(style, confidence), unsafe_allow_html=True)
     
+    # Display DOI and URL validation status
+    validation_msgs = []
+    if validation_result['doi_found']:
+        if validation_result['rate_limited']:
+            validation_msgs.append(f"⏳ **DOI:** {validation_result['doi_text']} (Rate limited - cannot validate)")
+        elif validation_result['doi_valid']:
+            validation_msgs.append(f"✅ **DOI:** {validation_result['doi_text']} (Valid)")
+        else:
+            validation_msgs.append(f"❌ **DOI:** {validation_result['doi_text']} (Invalid or unreachable)")
+    
+    if validation_result['url_found']:
+        validation_msgs.append(f"🔗 **URL:** {validation_result['url_text']} (Found)")
+    
+    if validation_msgs:
+        st.markdown("**Validation Status:**")
+        for msg in validation_msgs:
+            st.markdown(f"- {msg}")
+    
+    # Display validation message if present
+    if validation_result['message']:
+        if validation_result['doi_valid']:
+            st.success(validation_result['message'])
+        elif validation_result['doi_found'] and not validation_result['doi_valid'] and not validation_result['rate_limited']:
+            st.error(validation_result['message'])
+        elif validation_result['rate_limited']:
+            st.warning(validation_result['message'])
+        else:
+            st.info(validation_result['message'])
+    
     if style != 'Unknown':
         format_validation = validate_citation_format(ref, style)
         
@@ -1021,6 +1088,9 @@ def display_reference_with_style(ref, validation_result, style_info, ref_type="s
                         st.markdown(f"**Year:** {components['year']}")
                     if components['title']:
                         st.markdown(f"**Title:** {components['title']}")
+                    if components['doi']:
+                        doi_status = "✅ Valid" if validation_result.get('doi_valid') else "❓ Not validated"
+                        st.markdown(f"**DOI:** {components['doi']} ({doi_status})")
                 with cols[1]:
                     if components['source']:
                         st.markdown(f"**Source:** {components['source']}")
@@ -1028,6 +1098,8 @@ def display_reference_with_style(ref, validation_result, style_info, ref_type="s
                         st.markdown(f"**Volume:** {components['volume']}")
                     if components['pages']:
                         st.markdown(f"**Pages:** {components['pages']}")
+                    if components['url']:
+                        st.markdown(f"**URL:** {components['url']}")
     
     if validation_result['scholar_search']:
         st.info(f"[🔍 Verify on Google Scholar]({validation_result['scholar_search']})")
@@ -1052,7 +1124,21 @@ def create_citation_report(references, style_counts):
         report += f"### Reference {i}\n"
         report += f"**Text:** {ref}\n"
         report += f"**Style:** {style_info[0]} (Confidence: {style_info[1]:.1%})\n"
-        report += f"**URL/DOI Valid:** {'Yes' if validation_result['valid'] else 'No'}\n"
+        
+        # DOI validation status
+        if validation_result['doi_found']:
+            if validation_result['rate_limited']:
+                report += f"**DOI:** {validation_result['doi_text']} (Rate limited)\n"
+            elif validation_result['doi_valid']:
+                report += f"**DOI:** {validation_result['doi_text']} (Valid)\n"
+            else:
+                report += f"**DOI:** {validation_result['doi_text']} (Invalid)\n"
+        
+        # URL status
+        if validation_result['url_found']:
+            report += f"**URL:** {validation_result['url_text']} (Found)\n"
+        
+        report += f"**Overall Valid:** {'Yes' if validation_result['valid'] else 'No'}\n"
         
         if style_info[0] != 'Unknown':
             format_validation = validate_citation_format(ref, style_info[0])
