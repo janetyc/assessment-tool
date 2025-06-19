@@ -1170,8 +1170,31 @@ def main():
                 text_content = ""
                 with st.spinner("Extracting text from PDF..."):
                     for page_num, page in enumerate(pdf_reader.pages, 1):
-                        text_content += f"\n--- Page {page_num} ---\n"
-                        text_content += page.extract_text()
+                        try:
+                            # Add page marker
+                            text_content += f"\n--- Page {page_num} ---\n"
+                            
+                            # Extract text with error handling
+                            try:
+                                page_text = page.extract_text()
+                            except UnicodeEncodeError as e:
+                                # Handle encoding errors by using a different encoding
+                                page_text = page.extract_text().encode('utf-8', errors='replace').decode('utf-8')
+                            except Exception as e:
+                                st.warning(f"Warning: Error extracting text from page {page_num}: {str(e)}")
+                                page_text = f"[Error extracting text from page {page_num}]"
+                            
+                            # Clean the text to remove invalid characters
+                            page_text = ''.join(char for char in page_text if ord(char) < 0x10000)
+                            text_content += page_text
+                            
+                        except Exception as e:
+                            st.warning(f"Warning: Error processing page {page_num}: {str(e)}")
+                            text_content += f"\n[Error processing page {page_num}]\n"
+                
+                if not text_content.strip():
+                    st.error("No text could be extracted from the PDF. The file might be scanned or contain only images.")
+                    return
                 
                 st.success(f"Successfully extracted text from {len(pdf_reader.pages)} pages!")
                 
